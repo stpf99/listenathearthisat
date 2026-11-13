@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-HearThis Player – GTK4 + GStreamer (flump3dec + local cache)
+HearThis Player – GTK4 + GStreamer (wybieralny dekoder MP3 + local cache)
 - cover „Teraz gra” u góry po prawej + info streamu
 - mini-ikona i pasek postępu przy wyszukiwaniu
 - undo/redo historii nawigacji (poprzednie / następne wyniki)
@@ -52,6 +52,7 @@ class Config:
         self.cache_enabled = False  # stream domyślnie; cache opcjonalnie
         self.cover_style = "vinyl"  # normal | vinyl | cd
         self.spin_enabled = True
+        self.mp3_decoder = "auto"  # auto | nazwa elementu GStreamer (np. mpg123audiodec)
         self.load()
 
     def load(self):
@@ -64,6 +65,7 @@ class Config:
                 if self.cover_style not in ("normal", "vinyl", "cd"):
                     self.cover_style = "vinyl"
                 self.spin_enabled = bool(data.get("spin_enabled", True))
+                self.mp3_decoder = data.get("mp3_decoder") or "auto"
             except Exception:
                 pass
 
@@ -74,6 +76,7 @@ class Config:
                 "cache_enabled": self.cache_enabled,
                 "cover_style": self.cover_style,
                 "spin_enabled": self.spin_enabled,
+                "mp3_decoder": self.mp3_decoder,
             }, indent=2),
             encoding="utf-8",
         )
@@ -749,7 +752,56 @@ class TrackRow(Gtk.ListBoxRow):
             GLib.idle_add(self.pic.set_paintable, tex)
 
 
-# ─────────────────────────── GStreamer (flump3dec + seek) ───────────────────────────
+# ─────────────────────────── Dekodery MP3 ───────────────────────────
+# Kolejność preferencji dla trybu „auto” (pierwszy dostępny w systemie wygrywa)
+MP3_DECODER_PREFERRED = (
+    "mpg123audiodec",
+    "avdec_mp3float",
+    "avdec_mp3",
+    "flump3dec",
+    "mad",
+)
+_MP3_CAPS = Gst.Caps.from_string("audio/mpeg, mpegversion=(int)1, layer=(int)3")
+
+
+def list_mp3_decoders() -> list[str]:
+    """Wszystkie elementy zainstalowane w systemie, które dekodują MP3 (audio/mpeg layer 3)."""
+    found = []
+    try:
+        factories = Gst.ElementFactory.list_get_elements(
+            Gst.ELEMENT_FACTORY_TYPE_DECODER | Gst.ELEMENT_FACTORY_TYPE_MEDIA_AUDIO,
+            Gst.Rank.NONE,
+        )
+        for f in factories:
+            if f.can_sink_any_caps(_MP3_CAPS):
+                found.append(f.get_name())
+    except Exception as e:
+        print("list_mp3_decoders error:", e)
+    # elementy, które nie zgłaszają layer=3 w caps, ale są znanymi dekoderami MP3
+    for name in MP3_DECODER_PREFERRED:
+        if name not in found and Gst.ElementFactory.find(name):
+            found.append(name)
+    # preferowane na początek, reszta alfabetycznie
+    pref = [n for n in MP3_DECODER_PREFERRED if n in found]
+    rest = sorted(n for n in found if n not in pref)
+    return pref + rest
+
+
+def resolve_mp3_decoder(choice: str | None) -> str:
+    """Zwraca nazwę elementu do użycia. 'auto' lub brakujący wybór → pierwszy dostępny."""
+    avail = list_mp3_decoders()
+    if choice and choice != "auto" and choice in avail:
+        return choice
+    if choice and choice != "auto":
+        print(f"Dekoder MP3 '{choice}' niedostępny – używam automatycznego wyboru")
+    if avail:
+        return avail[0]
+    print("UWAGA: nie znaleziono żadnego dekodera MP3 w GStreamer "
+          "(zainstaluj gst-plugins-good/mpg123 lub gst-libav)")
+    return "decodebin"
+
+
+# ─────────────────────────── GStreamer (dekoder MP3 + seek) ───────────────────────────
 def _gst_escape_path(path: str) -> str:
     """Escape path for gst-parse-launch (spaces, quotes, backslash)."""
     return path.replace("\\", "\\\\").replace('"', '\\"')
@@ -764,9 +816,9 @@ def _pick_audiosink() -> str:
 
 class LocalGstPlayer(GObject.GObject):
     """
-    Stream: souphttpsrc ! mpegaudioparse ! flump3dec ! …
-    Plik:   filesrc      ! mpegaudioparse ! flump3dec ! …
-    flump3dec bez URI – dane z pads (souphttpsrc / filesrc).
+    Stream: souphttpsrc ! mpegaudioparse ! <dekoder MP3> ! …
+    Plik:   filesrc      ! mpegaudioparse ! <dekoder MP3> ! …
+    Dekoder wybierany w Preferencjach (domyślnie auto = pierwszy dostępny).
     """
 
     def __init__(self):
@@ -778,6 +830,16 @@ class LocalGstPlayer(GObject.GObject):
         self._muted = False
         self._duration_s = 0
         self._sink_name = _pick_audiosink()
+        self.decoder_choice = "auto"
+        self.decoder_name = None  # faktycznie użyty element
+
+    def set_decoder(self, choice: str | None):
+        self.decoder_choice = choice or "auto"
+
+    def _decoder(self) -> str:
+        self.decoder_name = resolve_mp3_decoder(self.decoder_choice)
+        print("Dekoder MP3:", self.decoder_name)
+        return self.decoder_name
 
     def set_known_duration(self, seconds: int):
         self._duration_s = max(0, int(seconds or 0))
@@ -793,10 +855,11 @@ class LocalGstPlayer(GObject.GObject):
     def _build_file(self, filepath: str):
         self.stop()
         loc = _gst_escape_path(filepath)
+        dec = self._decoder()
         desc = (
             f'filesrc location="{loc}" ! '
             f"queue max-size-time=2000000000 ! "
-            f"mpegaudioparse ! flump3dec ! "
+            f"mpegaudioparse ! {dec} ! "
             f"audioconvert ! audioresample ! "
             f"volume name=vol ! "
             f"queue ! {self._sink_name} sync=true"
@@ -807,7 +870,7 @@ class LocalGstPlayer(GObject.GObject):
             print("file pipeline error:", e)
             desc = (
                 f'filesrc location="{loc}" ! '
-                f"flump3dec ! audioconvert ! audioresample ! "
+                f"{dec} ! audioconvert ! audioresample ! "
                 f"volume name=vol ! {self._sink_name}"
             )
             self.pipeline = Gst.parse_launch(desc)
@@ -816,11 +879,12 @@ class LocalGstPlayer(GObject.GObject):
     def _build_stream(self, url: str):
         self.stop()
         loc = _gst_escape_path(url)
-        # souphttpsrc → flump3dec (bez zapisu na dysk)
+        dec = self._decoder()
+        # souphttpsrc → dekoder (bez zapisu na dysk)
         desc = (
             f'souphttpsrc location="{loc}" is-live=false iradio-mode=false ! '
             f"queue max-size-bytes=2097152 max-size-time=0 max-size-buffers=0 ! "
-            f"mpegaudioparse ! flump3dec ! "
+            f"mpegaudioparse ! {dec} ! "
             f"audioconvert ! audioresample ! "
             f"volume name=vol ! "
             f"queue ! {self._sink_name} sync=true"
@@ -831,7 +895,7 @@ class LocalGstPlayer(GObject.GObject):
             print("stream pipeline error, fallback:", e)
             desc = (
                 f'souphttpsrc location="{loc}" ! '
-                f"flump3dec ! audioconvert ! audioresample ! "
+                f"{dec} ! audioconvert ! audioresample ! "
                 f"volume name=vol ! {self._sink_name}"
             )
             self.pipeline = Gst.parse_launch(desc)
@@ -909,7 +973,7 @@ class LocalGstPlayer(GObject.GObject):
         if not self.pipeline:
             return
         sec = max(0, int(sec))
-        # FLUSH + KEY_UNIT – stabilne z flump3dec + mpegaudioparse
+        # FLUSH + KEY_UNIT – stabilne z mpegaudioparse + dekoderem MP3
         ok = self.pipeline.seek_simple(
             Gst.Format.TIME,
             Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT,
@@ -935,6 +999,7 @@ class HearThisApp(Gtk.Application):
 
         self.cfg = Config()
         self.player = LocalGstPlayer()
+        self.player.set_decoder(self.cfg.mp3_decoder)
         self.player.on_eos = self._on_eos
         self.history = NavHistory()
 
@@ -1387,6 +1452,23 @@ class HearThisApp(Gtk.Application):
         spin_check.set_active(self.cfg.spin_enabled)
         box.append(spin_check)
 
+        box.append(Gtk.Label(label="Dekoder MP3 (dostępne w systemie)", xalign=0))
+        dec_names = ["auto"] + list_mp3_decoders()
+        dec_dd = Gtk.DropDown(model=Gtk.StringList.new(dec_names))
+        try:
+            dec_dd.set_selected(dec_names.index(self.cfg.mp3_decoder))
+        except ValueError:
+            dec_dd.set_selected(0)
+        box.append(dec_dd)
+        dec_hint = Gtk.Label(
+            label=f"auto = pierwszy dostępny (teraz: {resolve_mp3_decoder('auto')}) · "
+                  "zmiana działa od następnego utworu",
+            xalign=0,
+            wrap=True,
+        )
+        dec_hint.add_css_class("dim-label")
+        box.append(dec_hint)
+
         def on_resp(dlg, resp):
             if resp == Gtk.ResponseType.OK:
                 u = entry.get_text().strip().lstrip("@")
@@ -1395,6 +1477,9 @@ class HearThisApp(Gtk.Application):
                 sel = style_dd.get_selected()
                 self.cfg.cover_style = styles[sel] if 0 <= sel < len(styles) else "vinyl"
                 self.cfg.spin_enabled = spin_check.get_active()
+                dsel = dec_dd.get_selected()
+                self.cfg.mp3_decoder = dec_names[dsel] if 0 <= dsel < len(dec_names) else "auto"
+                self.player.set_decoder(self.cfg.mp3_decoder)
                 self.cfg.save()
                 self._update_user_ui()
                 if getattr(self, "_cover_is_disc", False):
@@ -1405,6 +1490,7 @@ class HearThisApp(Gtk.Application):
                     f"Preferencje: {self.cfg.cover_style}"
                     + (", spin" if self.cfg.spin_enabled else "")
                     + (", cache" if self.cfg.cache_enabled else ", stream")
+                    + f", mp3: {self.cfg.mp3_decoder}"
                 )
             elif resp == Gtk.ResponseType.REJECT:
                 self.cfg.username = None
